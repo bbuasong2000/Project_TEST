@@ -16,6 +16,13 @@
 2. `pip install numpy`
 3. ffmpeg 설치 후 PATH 등록 (명령 프롬프트에서 `ffmpeg -version` 이 실행되어야 함)
 
+## 간단 실행 (sync_subtitles.bat)
+
+`subtitle_sync.py`와 `sync_subtitles.bat`을 같은 폴더에 두고 bat 파일을 더블클릭하면
+`F:\[애니]\[일본] 명탐정 코난` 폴더(하위 폴더 포함)를 `--split --recursive`로 보정합니다.
+다른 폴더는 그 폴더를 bat 파일 위로 끌어다 놓으면 됩니다.
+Python, ffmpeg가 없으면 안내 메시지를 띄우고, numpy가 없으면 자동으로 설치합니다.
+
 ## 사용법
 
 ```powershell
