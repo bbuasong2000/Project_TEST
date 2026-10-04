@@ -53,6 +53,14 @@ FPS_RATIOS = [
 
 # 피크 신뢰도(PSR) 기준
 PSR_MIN = 5.0
+# 이 이상이면 앞뒤 화의 오프셋과 일치할 때 적용할 수 있다 (PSR_LOW <= PSR < PSR_MIN)
+PSR_LOW = 2.5
+# 이 이상이면 구간 검증에서 혼자 튀는 값이라도 무시하지 않는다
+PSR_GOOD = 8.0
+# 앞뒤 화 비교: 앞뒤 몇 편씩 볼지, 최소 몇 편이 같아야 하는지, 허용 차이
+NEIGHBOR_SPAN = 3
+NEIGHBOR_MIN = 3
+NEIGHBOR_TOL_MS = 500
 # 이보다 작은 차이는 "정상"으로 본다
 OK_OFFSET_MS = 100
 # 구간별 편차가 이보다 크면 구간별 보정을 시도한다
@@ -71,6 +79,13 @@ RESIDUAL_OK_MS = 150
 SEG_RESIDUAL_OK_MS = 500
 # 보정 후 일치도가 원본보다 최소 이만큼(비율) 올라야 "개선"으로 인정
 SCORE_GAIN_MIN = 0.01
+
+# 구간별 보정에서 이 정도 차이 안의 이웃 구간은 하나로 합친다
+MERGE_MS = 300
+# 노래 가사 자막 판단: 음표 기호, 틈 없이 이어지는 묶음의 기준
+SONG_MARKS = ("♪", "♬", "♩", "♫")
+SONG_GAP_MS = 500
+SONG_RUN_MS = 40000
 
 # 덮어쓰기 전에 원본 자막을 보관하는 폴더 이름 (자막이 있는 폴더 안에 만들어진다)
 BACKUP_DIR = "_자막원본백업"
@@ -141,21 +156,28 @@ def ass_stamp(ms):
     return "%d:%02d:%02d.%02d" % (h, m, s, rest)
 
 
-def parse_cues(text, ext):
-    """자막의 표시 구간 목록 [(시작ms, 끝ms), ...] 을 반환한다."""
-    cues = []
+def parse_cue_items(text, ext):
+    """자막의 표시 구간과 내용 [(시작ms, 끝ms, 내용), ...] 을 반환한다."""
+    items = []
     if ext == ".srt":
-        for m in SRT_TIME_RE.finditer(text):
+        matches = list(SRT_TIME_RE.finditer(text))
+        for i, m in enumerate(matches):
             start = ms_from_parts(m.group(1), m.group(2), m.group(3), m.group(4), len(m.group(4)))
             end = ms_from_parts(m.group(6), m.group(7), m.group(8), m.group(9), len(m.group(9)))
+            body_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            body = text[m.end():body_end].strip().split("\n\n")[0]
             if end > start:
-                cues.append((start, end))
+                items.append((start, end, TAG_RE.sub("", body).strip()))
     elif ext in (".ass", ".ssa"):
         for m in ASS_DIALOGUE_RE.finditer(text):
             start = ms_from_parts(m.group(2), m.group(3), m.group(4), m.group(5), 2)
             end = ms_from_parts(m.group(6), m.group(7), m.group(8), m.group(9), 2)
+            line_end = text.find("\n", m.end())
+            rest = text[m.end(): line_end if line_end >= 0 else len(text)]
+            fields = rest.split(",", 6)
+            body = fields[6] if len(fields) > 6 else rest
             if end > start:
-                cues.append((start, end))
+                items.append((start, end, body.strip()))
     elif ext == ".smi":
         blocks = []
         for m in SMI_BLOCK_RE.finditer(text):
@@ -167,11 +189,56 @@ def parse_cues(text, ext):
             end = blocks[i + 1][0]
             if body and end > start:
                 # 다음 SYNC까지 너무 길면(대사 없는 긴 공백) 최대 10초로 자른다
-                cues.append((start, min(end, start + 10000)))
+                items.append((start, min(end, start + 10000), body))
         if blocks and blocks[-1][1]:
-            cues.append((blocks[-1][0], blocks[-1][0] + 3000))
+            items.append((blocks[-1][0], blocks[-1][0] + 3000, blocks[-1][1]))
     # 여러 언어/스타일이 겹치는 경우를 위해 정렬
-    cues.sort()
+    items.sort()
+    return items
+
+
+def parse_cues(text, ext):
+    """자막의 표시 구간 목록 [(시작ms, 끝ms), ...] 을 반환한다."""
+    cues = []
+    for start, end, _ in parse_cue_items(text, ext):
+        cues.append((start, end))
+    return cues
+
+
+def speech_cues(text, ext):
+    """싱크 계산에 쓸 대사 구간만 고른다. 오프닝/엔딩 노래 가사 자막은 뺀다.
+
+    - 내용에 ♪ 같은 음표가 있으면 가사로 본다.
+    - 자막이 틈(0.5초 미만) 없이 40초 이상 계속 이어지는 묶음도 노래로 본다.
+    가사를 빼서 남는 대사가 너무 적으면 전체를 그대로 쓴다.
+    """
+    items = parse_cue_items(text, ext)
+    marked = []
+    for start, end, body in items:
+        is_song = False
+        for mark in SONG_MARKS:
+            if mark in body:
+                is_song = True
+                break
+        marked.append([start, end, is_song])
+
+    # 틈 없이 길게 이어지는 묶음 찾기
+    run_start = 0
+    for i in range(1, len(marked) + 1):
+        continuous = i < len(marked) and marked[i][0] - marked[i - 1][1] < SONG_GAP_MS
+        if continuous:
+            continue
+        if marked[i - 1][1] - marked[run_start][0] >= SONG_RUN_MS and i - run_start >= 5:
+            for k in range(run_start, i):
+                marked[k][2] = True
+        run_start = i
+
+    cues = []
+    for start, end, is_song in marked:
+        if not is_song:
+            cues.append((start, end))
+    if len(cues) < max(10, len(marked) // 3):
+        return parse_cues(text, ext)
     return cues
 
 
@@ -245,23 +312,47 @@ def extract_audio(video):
     return np.frombuffer(proc.stdout, dtype=np.int16).astype(np.float32)
 
 
+def moving_mean(x, win):
+    """(프레임, 주파수) 배열의 시간축 이동 평균."""
+    total = np.cumsum(np.vstack([np.zeros((1, x.shape[1]), dtype=np.float64), x]), axis=0)
+    idx = np.arange(x.shape[0])
+    lo = np.clip(idx - win // 2, 0, x.shape[0])
+    hi = np.clip(idx + win // 2 + 1, 0, x.shape[0])
+    return ((total[hi] - total[lo]) / (hi - lo)[:, None]).astype(np.float32)
+
+
+def normalize(values):
+    """무음 쪽(하위 20%)과 큰 소리 쪽(상위 5%) 기준으로 0~1로 맞추고 표준화한다."""
+    values = np.convolve(values, np.ones(5, dtype=np.float32) / 5, mode="same")
+    floor = np.percentile(values, 20)
+    top = np.percentile(values, 95)
+    sig = np.clip((values - floor) / max(top - floor, 1e-6), 0.0, 1.0)
+    sig = sig - sig.mean()
+    return sig / (sig.std() + 1e-9)
+
+
 def speech_signal(samples):
-    """10ms 프레임마다 음성 대역(300~3400Hz) 에너지를 구해 정규화한 신호."""
+    """10ms 프레임마다 "말소리가 있을 법한 정도"를 구한다.
+
+    두 신호를 더해 쓴다.
+    - 음성 대역(300~3400Hz) 에너지: 대사가 크게 들리는 구간
+    - 음성 대역의 순간 변화량: 각 주파수의 최근 2초 평균보다 커진 정도.
+      배경음악처럼 계속 이어지는 소리는 빠지고 말소리처럼 짧게 변하는 소리가 남는다.
+    """
     n_frames = len(samples) // FRAME_LEN
     frames = samples[: n_frames * FRAME_LEN].reshape(n_frames, FRAME_LEN)
     frames = frames * np.hanning(FRAME_LEN).astype(np.float32)
     spec = np.abs(np.fft.rfft(frames, axis=1)) ** 2
     freqs = np.fft.rfftfreq(FRAME_LEN, 1.0 / SAMPLE_RATE)
-    band = (freqs >= 300) & (freqs <= 3400)
-    energy = np.log10(spec[:, band].sum(axis=1) + 1e-6)
-    # 짧은 순간 잡음을 줄이기 위해 50ms 이동 평균
-    kernel = np.ones(5, dtype=np.float32) / 5
-    energy = np.convolve(energy, kernel, mode="same")
-    # 무음 구간 기준으로 정규화하고, 큰 값은 잘라서 효과음 영향을 줄인다
-    floor = np.percentile(energy, 20)
-    top = np.percentile(energy, 95)
-    sig = np.clip((energy - floor) / max(top - floor, 1e-6), 0.0, 1.0)
-    return sig - sig.mean()
+    band_spec = spec[:, (freqs >= 300) & (freqs <= 3400)]
+    del spec
+
+    energy = np.log10(band_spec.sum(axis=1) + 1e-6)
+    log_spec = np.log10(band_spec + 1e-3).astype(np.float32)
+    del band_spec
+    contrast = np.clip(log_spec - moving_mean(log_spec, 200), 0.0, None).mean(axis=1)
+
+    return (normalize(energy) + normalize(contrast)).astype(np.float32)
 
 
 def cue_signal(cues, length, ratio, window=None):
@@ -384,11 +475,24 @@ def evaluate(audio, cues, tmap, segment_ms, search_ms):
     lag, _, _ = peak_info(lags, values)
     # 구간 검증은 넓게 찾아야 광고 컷처럼 크게 어긋난 구간도 잡아낸다
     segments = segment_offsets(audio, mapped, 1.0, 0, segment_ms, search_ms)
+    reliable = []
+    for seg in segments:
+        if seg[2] >= PSR_MIN:
+            reliable.append(seg)
+    # 잡음 많은 영상에서는 한 구간만 우연히 엉뚱한 값이 나올 수 있다.
+    # 확실한 구간(PSR_GOOD 이상)이거나, 바로 옆 구간도 비슷하게 어긋난 경우만 실제 어긋남으로 본다.
     seg_max = 0
-    seg_count = 0
-    for _, off in reliable_segments(segments):
-        seg_count += 1
-        seg_max = max(seg_max, abs(off))
+    for i, (_, off, psr, _) in enumerate(reliable):
+        if abs(off) <= SEG_RESIDUAL_OK_MS:
+            seg_max = max(seg_max, abs(off))
+            continue
+        confirmed = psr >= PSR_GOOD
+        for j in (i - 1, i + 1):
+            if 0 <= j < len(reliable) and abs(reliable[j][1] - off) <= 1000:
+                confirmed = True
+        if confirmed:
+            seg_max = max(seg_max, abs(off))
+    seg_count = len(reliable)
     return {
         "score": float(values[max_lag]),
         "residual": lag * FRAME_MS,
@@ -448,13 +552,21 @@ def piecewise_offsets(segments, global_offset_ms):
         right = offsets[i + 1][1]
         if abs(left - right) <= OK_OFFSET_MS and abs(offsets[i][1] - left) > SPREAD_WARN_MS:
             offsets[i][1] = left
+    # 맨 앞/맨 뒤 구간도 바로 옆 두 구간이 같은 값이면 그 값으로 맞춘다
+    if len(offsets) >= 3:
+        if (abs(offsets[1][1] - offsets[2][1]) <= OK_OFFSET_MS
+                and abs(offsets[0][1] - offsets[1][1]) > SPREAD_WARN_MS):
+            offsets[0][1] = offsets[1][1]
+        if (abs(offsets[-2][1] - offsets[-3][1]) <= OK_OFFSET_MS
+                and abs(offsets[-1][1] - offsets[-2][1]) > SPREAD_WARN_MS):
+            offsets[-1][1] = offsets[-2][1]
     if not offsets:
         return [(0, global_offset_ms)]
     offsets[0][0] = 0
-    # 오프셋이 같은 이웃 구간은 하나로 합친다
+    # 오프셋이 거의 같은(0.3초 이내) 이웃 구간은 하나로 합친다
     result = []
     for seg_start, off in offsets:
-        if result and result[-1][1] == off:
+        if result and abs(result[-1][1] - off) <= MERGE_MS:
             continue
         result.append((seg_start, off))
     return result
@@ -594,58 +706,98 @@ def build_candidates(audio, cues, args):
     return candidates, info
 
 
-def process(video, sub, args):
-    row = {
+def new_row(sub):
+    return {
         "폴더": "", "자막": sub.name, "판정": "", "적용 방법": "", "오프셋(초)": "",
         "비율": "", "신뢰도(PSR)": "", "원본 검증": "", "보정 후 검증": "",
         "시도 내역": "", "메모": "",
     }
+
+
+def analyze_file(video, sub, args):
+    """1) 점검과 2) 수정안 만들기, 3) 수정안 검증까지 한다. 적용 여부는 decide()가 정한다."""
+    row = new_row(sub)
+    rec = {"row": row, "sub": sub, "final": False, "base_off": None, "base_psr": 0.0}
     # 이미 덮어쓴 적이 있으면 백업해 둔 원본을 기준으로 다시 계산한다 (반복 실행해도 안전)
     backup = backup_path(sub)
-    source = backup if backup.exists() else sub
-    text, encoding = read_text(source)
+    from_backup = backup.exists()
+    text, encoding = read_text(backup if from_backup else sub)
     ext = sub.suffix.lower()
-    cues = parse_cues(text, ext)
+    # 싱크 계산에는 대사만 쓴다 (노래 가사 제외). 시간 보정은 모든 자막에 적용된다.
+    cues = speech_cues(text, ext)
     if len(cues) < 10:
         row["판정"] = "건너뜀"
         row["메모"] = "자막 대사를 읽지 못함 (대사 %d개)" % len(cues)
-        return row
+        rec["final"] = True
+        return rec
 
     audio = pad_audio(speech_signal(extract_audio(video)), cues)
     segment_ms = args.segment * 1000
     search_ms = args.segment_search * 1000
     candidates, info = build_candidates(audio, cues, args)
+    rec["base_off"] = info["base_off"]
+    rec["base_psr"] = info["base_psr"]
     row["신뢰도(PSR)"] = "%.1f" % info["base_psr"]
 
-    # 1) 점검: 원본 그대로 검증
     original = evaluate(audio, cues, TimeMap(1.0, [(0, 0)]), segment_ms, search_ms)
     row["원본 검증"] = describe(original)
-    if passes(original):
+    if passes(original) and info["base_psr"] >= PSR_LOW:
         row["판정"] = "정상"
         row["오프셋(초)"] = "%+.2f" % (original["residual"] / 1000.0)
-        if source is backup:
+        if from_backup:
             row["메모"] = "백업 원본 기준으로 정상"
-        return row
+        rec["final"] = True
+        return rec
 
-    # 2) 수정 -> 3) 검증 -> 실패하면 다음 방법으로 재수정
+    results = []
+    for name, tmap, psr in candidates:
+        results.append((name, tmap, psr, evaluate(audio, cues, tmap, segment_ms, search_ms)))
+    rec.update({"text": text, "ext": ext, "encoding": encoding, "backup": backup,
+                "original": original, "results": results})
+    return rec
+
+
+def count_agree(offset, neighbors):
+    count = 0
+    for off in neighbors:
+        if abs(off - offset) <= NEIGHBOR_TOL_MS:
+            count += 1
+    return count
+
+
+def decide(rec, neighbors, args):
+    """검증 결과와 앞뒤 화 측정값을 보고 적용할 수정안을 고르고, 덮어쓴다."""
+    row = rec["row"]
+    if rec["final"]:
+        return row
+    original = rec["original"]
     attempts = []
     chosen = None
     best_any = None
     min_score = original["score"] + SCORE_GAIN_MIN * abs(original["score"])
-    for name, tmap, psr in candidates:
-        ev = evaluate(audio, cues, tmap, segment_ms, search_ms)
+    for name, tmap, psr, ev in rec["results"]:
         if best_any is None or ev["score"] > best_any[2]["score"]:
             best_any = (name, tmap, ev, psr)
-        if psr < PSR_MIN:
-            attempts.append("%s: 신뢰도 낮음(PSR %.1f)" % (name, psr))
+        label = "%s(%+.2f초)" % (name, tmap.offsets[0] / 1000.0)
+        if psr < PSR_LOW or (psr < PSR_MIN and name == "구간별"):
+            attempts.append("%s: 신뢰도 낮음(PSR %.1f)" % (label, psr))
             continue
+        if psr < PSR_MIN:
+            # 신뢰도가 애매하면 앞뒤 화도 같은 오프셋으로 측정됐을 때만 믿는다
+            agree = count_agree(tmap.offsets[0], neighbors)
+            if agree < NEIGHBOR_MIN:
+                attempts.append("%s: 신뢰도 낮음(PSR %.1f), 앞뒤 화와 일치 %d편" % (label, psr, agree))
+                continue
         if not passes(ev):
-            attempts.append("%s: 검증 실패(%s)" % (name, describe(ev)))
+            attempts.append("%s: 검증 실패(%s)" % (label, describe(ev)))
             continue
         if ev["score"] < min_score:
-            attempts.append("%s: 개선 없음(%s)" % (name, describe(ev)))
+            attempts.append("%s: 개선 없음(%s)" % (label, describe(ev)))
             continue
-        attempts.append("%s: 통과" % name)
+        if psr < PSR_MIN:
+            attempts.append("%s: 통과(앞뒤 화 %d편과 일치)" % (label, count_agree(tmap.offsets[0], neighbors)))
+        else:
+            attempts.append("%s: 통과" % label)
         chosen = (name, tmap, ev, psr)
         break
     row["시도 내역"] = " / ".join(attempts)
@@ -674,13 +826,15 @@ def process(video, sub, args):
         return row
 
     # 4) 덮어쓰기: 처음 한 번만 원본을 백업해 둔다
+    sub = rec["sub"]
+    backup = rec["backup"]
     if not backup.exists():
         backup.parent.mkdir(exist_ok=True)
         shutil.copy2(str(sub), str(backup))
-    used = write_text(sub, apply_map(text, ext, tmap), encoding)
+    used = write_text(sub, apply_map(rec["text"], rec["ext"], tmap), rec["encoding"])
     row["판정"] = "보정 완료"
-    if used != encoding:
-        row["메모"] = (row["메모"] + "; " if row["메모"] else "") + "인코딩 %s -> %s" % (encoding, used)
+    if used != rec["encoding"]:
+        row["메모"] = (row["메모"] + "; " if row["메모"] else "") + "인코딩 %s -> %s" % (rec["encoding"], used)
     return row
 
 
@@ -695,6 +849,52 @@ def restore(folder):
                 shutil.copy2(str(path), str(backup_dir.parent / path.name))
                 count += 1
     print("원본 자막 %d개를 되돌렸습니다." % count)
+
+
+def neighbor_offsets(buffer, index):
+    """앞뒤 NEIGHBOR_SPAN 편에서 믿을 만하게 측정된 오프셋 목록 (자기 자신 제외)."""
+    result = []
+    lo = max(0, index - NEIGHBOR_SPAN)
+    hi = min(len(buffer), index + NEIGHBOR_SPAN + 1)
+    for k in range(lo, hi):
+        if k == index:
+            continue
+        rec = buffer[k]
+        if rec["base_off"] is not None and rec["base_psr"] >= PSR_LOW:
+            result.append(rec["base_off"])
+    return result
+
+
+def flush_buffer(buffer, start, stop, folder, writer, f, summary, args):
+    """buffer[start:stop] 의 파일을 판정·적용하고 보고서에 기록한다."""
+    for index in range(start, stop):
+        rec = buffer[index]
+        try:
+            row = decide(rec, neighbor_offsets(buffer, index), args)
+        except Exception as exc:
+            row = rec["row"]
+            row["판정"] = "오류"
+            row["메모"] = str(exc)
+        row["폴더"] = str(rec["sub"].parent.relative_to(folder))
+        print("    => %s : %s  %s  %s" % (rec["sub"].name, row.get("판정", ""),
+                                         row.get("오프셋(초)", ""), row.get("시도 내역", "")))
+        if row.get("메모"):
+            print("       %s" % row["메모"])
+        writer.writerow(row)
+        f.flush()
+        summary[row["판정"]] = summary.get(row["판정"], 0) + 1
+
+
+def natural_key(pair):
+    """파일 이름 속 숫자를 숫자 크기대로 정렬한다 (1, 2, ... 10, ... 100)."""
+    sub = pair[1]
+    parts = []
+    for token in re.split(r"(\d+)", sub.name.lower()):
+        if token.isdigit():
+            parts.append((0, int(token), ""))
+        else:
+            parts.append((1, 0, token))
+    return (str(sub.parent).lower(), parts)
 
 
 def main(argv=None):
@@ -721,35 +921,44 @@ def main(argv=None):
         return
 
     pairs, unmatched = find_pairs(folder, args.recursive)
+    pairs.sort(key=natural_key)
     print("영상/자막 쌍 %d개, 짝 없는 자막 %d개" % (len(pairs), len(unmatched)))
-
-    rows = []
-    for i, (video, sub) in enumerate(pairs, 1):
-        print("[%d/%d] %s" % (i, len(pairs), sub.name), flush=True)
-        try:
-            row = process(video, sub, args)
-        except Exception as exc:  # 한 파일 실패가 전체를 멈추지 않도록
-            row = {"자막": sub.name, "판정": "오류", "메모": str(exc)}
-        row["폴더"] = str(sub.parent.relative_to(folder))
-        print("    -> %s  %s  %s" % (row.get("판정", ""), row.get("적용 방법", ""),
-                                    row.get("메모", "") or row.get("시도 내역", "")))
-        rows.append(row)
-    for sub in unmatched:
-        rows.append({"폴더": str(sub.parent.relative_to(folder)), "자막": sub.name,
-                     "판정": "짝 없음", "메모": "같은 이름의 영상 파일이 없음"})
 
     fields = ["폴더", "자막", "판정", "적용 방법", "오프셋(초)", "비율", "신뢰도(PSR)",
               "원본 검증", "보정 후 검증", "시도 내역", "메모"]
     report = folder / args.report
+    summary = {}
+    # 보고서는 한 편 끝날 때마다 바로 저장한다 (중간에 멈춰도 기록이 남도록)
     with open(report, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+        for sub in unmatched:
+            writer.writerow({"폴더": str(sub.parent.relative_to(folder)), "자막": sub.name,
+                             "판정": "짝 없음", "메모": "같은 이름의 영상 파일이 없음"})
+            summary["짝 없음"] = summary.get("짝 없음", 0) + 1
+        f.flush()
 
-    summary = {}
-    for row in rows:
-        summary[row["판정"]] = summary.get(row["판정"], 0) + 1
+        # 앞뒤 화와 비교하기 위해 판정은 NEIGHBOR_SPAN 편 늦게 한다
+        buffer = []
+        decided = 0
+        for i, (video, sub) in enumerate(pairs, 1):
+            print("[%d/%d] 분석 중: %s" % (i, len(pairs), sub.name), flush=True)
+            if buffer and buffer[0]["sub"].parent != sub.parent:
+                flush_buffer(buffer, decided, len(buffer), folder, writer, f, summary, args)
+                buffer = []
+                decided = 0
+            try:
+                rec = analyze_file(video, sub, args)
+            except Exception as exc:  # 한 파일 실패가 전체를 멈추지 않도록
+                rec = {"row": new_row(sub), "sub": sub, "final": True, "base_off": None, "base_psr": 0.0}
+                rec["row"]["판정"] = "오류"
+                rec["row"]["메모"] = str(exc)
+            buffer.append(rec)
+            if len(buffer) - decided > NEIGHBOR_SPAN:
+                flush_buffer(buffer, decided, decided + 1, folder, writer, f, summary, args)
+                decided += 1
+        flush_buffer(buffer, decided, len(buffer), folder, writer, f, summary, args)
+
     parts = []
     for key, value in summary.items():
         parts.append("%s %d" % (key, value))
