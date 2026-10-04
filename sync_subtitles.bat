@@ -31,7 +31,7 @@ if errorlevel 1 (
     if errorlevel 1 goto no_numpy
 )
 
-python "%SCRIPT%" "%TARGET%" --split --recursive
+python "%SCRIPT%" "%TARGET%" --recursive
 echo.
 echo 완료되었습니다. 대상 폴더의 subtitle_sync_report.csv 에서 결과를 확인하세요.
 pause

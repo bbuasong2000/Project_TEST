@@ -7,16 +7,24 @@
 지원 자막: .smi / .srt / .ass / .ssa
 필요 프로그램: Python 3.8+, numpy, ffmpeg (PATH에 등록)
 
+처리 순서 (파일마다):
+    1) 점검  : 원본 자막이 음성과 맞는지 검증한다. 맞으면 그대로 둔다.
+    2) 수정  : 전체 이동 / 프레임레이트 비율 / 구간별 보정 중 간단한 것부터 만든다.
+    3) 검증  : 보정한 자막을 음성과 다시 비교한다.
+    4) 재수정: 검증에 실패하면 다음 방법으로 다시 시도한다.
+    통과한 보정만 원본 자막에 덮어쓴다. 원본은 처음 한 번 "_자막원본백업" 폴더에 보관한다.
+
 사용 예:
-    python subtitle_sync.py "F:\\[애니]\\[일본] 명탐정 코난" --check
-    python subtitle_sync.py "F:\\[애니]\\[일본] 명탐정 코난"
-    python subtitle_sync.py "F:\\[애니]\\[일본] 명탐정 코난" --split
+    python subtitle_sync.py "F:\\[애니]\\[일본] 명탐정 코난" --recursive --check
+    python subtitle_sync.py "F:\\[애니]\\[일본] 명탐정 코난" --recursive
+    python subtitle_sync.py "F:\\[애니]\\[일본] 명탐정 코난" --restore
 """
 
 import argparse
 import bisect
 import csv
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -44,12 +52,28 @@ FPS_RATIOS = [
 ]
 
 # 피크 신뢰도(PSR) 기준
-PSR_GOOD = 8.0
 PSR_MIN = 5.0
 # 이보다 작은 차이는 "정상"으로 본다
 OK_OFFSET_MS = 100
-# 구간별 편차가 이보다 크면 경고한다
+# 구간별 편차가 이보다 크면 구간별 보정을 시도한다
 SPREAD_WARN_MS = 500
+# 영상 전체에 걸쳐 어긋남이 이만큼 이상 변할 때만 프레임레이트 비율 보정을 고려한다
+DRIFT_MIN_MS = 400
+# 추정한 비율이 흔한 프레임레이트 비율과 이 정도 안으로 일치해야 적용한다
+RATIO_TOL = 0.0004
+# 이보다 1에 가까운 비율은 "작은 비율"로 보고 구간별 추세로만 판단한다
+SMALL_RATIO = 0.005
+# 큰 비율은 비율 1.0보다 일치도가 이 배수 이상 높아야 인정한다
+BIG_RATIO_GAIN = 1.5
+# 검증: 보정 후 다시 찾아볼 범위와 합격 기준
+VERIFY_SEARCH_MS = 10000
+RESIDUAL_OK_MS = 150
+SEG_RESIDUAL_OK_MS = 500
+# 보정 후 일치도가 원본보다 최소 이만큼(비율) 올라야 "개선"으로 인정
+SCORE_GAIN_MIN = 0.01
+
+# 덮어쓰기 전에 원본 자막을 보관하는 폴더 이름 (자막이 있는 폴더 안에 만들어진다)
+BACKUP_DIR = "_자막원본백업"
 
 
 # ---------------------------------------------------------------------------
@@ -290,29 +314,96 @@ def peak_info(lags, values):
     return int(lags[best]), float(values[best]), psr
 
 
-def analyze(audio_sig, cues, max_offset_ms, try_ratios):
-    """전체 자막에 대한 최적 (비율, 오프셋ms, 상관값, PSR)."""
+def pad_audio(audio_sig, cues):
+    """자막이 영상보다 길게 이어져도 계산할 수 있도록 음성 신호 뒤를 0으로 채운다."""
     length = max(len(audio_sig), int(cues[-1][1] * 1.3 / FRAME_MS) + 1)
     audio = np.zeros(length, dtype=np.float32)
     audio[: len(audio_sig)] = audio_sig
-    max_lag = max_offset_ms // FRAME_MS
+    return audio
 
-    ratios = FPS_RATIOS if try_ratios else [1.0]
-    best = None
-    for ratio in ratios:
-        sub = cue_signal(cues, length, ratio)
-        lags, values = correlate(audio, sub, max_lag)
-        lag, score, psr = peak_info(lags, values)
-        if best is None or score > best[2]:
-            best = (ratio, lag * FRAME_MS, score, psr)
-    # 비율 1.0이 거의 같은 점수면 1.0을 우선 (잘못된 비율 선택 방지)
-    if best[0] != 1.0:
-        sub = cue_signal(cues, length, 1.0)
-        lags, values = correlate(audio, sub, max_lag)
-        lag, score, psr = peak_info(lags, values)
-        if score >= best[2] * 0.97:
-            best = (1.0, lag * FRAME_MS, score, psr)
-    return best, audio
+
+def global_search(audio, cues, ratio, max_offset_ms):
+    """정해진 비율에서 전체 자막을 가장 잘 맞추는 (오프셋ms, PSR, 일치도)."""
+    sub = cue_signal(cues, len(audio), ratio)
+    lags, values = correlate(audio, sub, max_offset_ms // FRAME_MS)
+    lag, score, psr = peak_info(lags, values)
+    return lag * FRAME_MS, psr, score
+
+
+def reliable_segments(segments):
+    result = []
+    for seg_start, off, psr, _ in segments:
+        if psr >= PSR_MIN:
+            result.append((seg_start, off))
+    return result
+
+
+def estimate_ratio(segments):
+    """구간별 오프셋이 시간에 따라 일정하게 커지거나 작아지면 프레임레이트 차이로 본다.
+
+    반환: (비율, 영상 전체에 걸친 어긋남 변화량ms)
+    잡음으로 비율을 잘못 고르지 않도록, 변화량이 충분히 크고 흔한 프레임레이트
+    비율과 거의 일치할 때만 1.0이 아닌 값을 돌려준다.
+    """
+    points = reliable_segments(segments)
+    if len(points) < 3:
+        return 1.0, 0.0
+    times = np.array([p[0] for p in points], dtype=np.float64)
+    offsets = np.array([p[1] for p in points], dtype=np.float64)
+    slope = float(np.polyfit(times, offsets, 1)[0])
+    drift = slope * (times[-1] - times[0])
+    if abs(drift) < DRIFT_MIN_MS:
+        return 1.0, drift
+    estimate = 1.0 + slope
+    for ratio in FPS_RATIOS:
+        if ratio != 1.0 and abs(ratio - estimate) <= RATIO_TOL:
+            return ratio, drift
+    return 1.0, drift
+
+
+def map_cues(cues, tmap):
+    mapped = []
+    for start, end in cues:
+        new_start = tmap(start)
+        mapped.append((new_start, new_start + (end - start) * tmap.ratio))
+    mapped.sort()
+    return mapped
+
+
+def evaluate(audio, cues, tmap, segment_ms, search_ms):
+    """보정을 적용한 자막이 음성과 얼마나 맞는지 다시 잰다 (검증).
+
+    score    : 그대로 겹쳤을 때의 일치도 (높을수록 좋음)
+    residual : 다시 찾아본 전체 어긋남 (0에 가까울수록 좋음)
+    seg_max  : 구간별로 다시 찾아본 어긋남 중 가장 큰 값
+    """
+    mapped = map_cues(cues, tmap)
+    sub = cue_signal(mapped, len(audio), 1.0)
+    max_lag = VERIFY_SEARCH_MS // FRAME_MS
+    lags, values = correlate(audio, sub, max_lag)
+    lag, _, _ = peak_info(lags, values)
+    # 구간 검증은 넓게 찾아야 광고 컷처럼 크게 어긋난 구간도 잡아낸다
+    segments = segment_offsets(audio, mapped, 1.0, 0, segment_ms, search_ms)
+    seg_max = 0
+    seg_count = 0
+    for _, off in reliable_segments(segments):
+        seg_count += 1
+        seg_max = max(seg_max, abs(off))
+    return {
+        "score": float(values[max_lag]),
+        "residual": lag * FRAME_MS,
+        "seg_max": seg_max,
+        "seg_count": seg_count,
+    }
+
+
+def passes(ev):
+    return abs(ev["residual"]) <= RESIDUAL_OK_MS and ev["seg_max"] <= SEG_RESIDUAL_OK_MS
+
+
+def describe(ev):
+    return "일치도 %.3f, 잔여 %+.2f초, 구간 최대 %.2f초" % (
+        ev["score"], ev["residual"] / 1000.0, ev["seg_max"] / 1000.0)
 
 
 def segment_offsets(audio, cues, ratio, global_offset_ms, segment_ms, search_ms):
@@ -423,17 +514,17 @@ def refine_bounds(audio, cues, ratio, pieces):
 # 파일 짝 찾기 / 실행
 # ---------------------------------------------------------------------------
 
-def find_pairs(folder, recursive, suffix):
+def find_pairs(folder, recursive):
     pattern = "**/*" if recursive else "*"
     videos = {}
     subs = []
     for path in sorted(folder.glob(pattern)):
-        if not path.is_file():
+        if not path.is_file() or BACKUP_DIR in path.parts:
             continue
         ext = path.suffix.lower()
         if ext in VIDEO_EXTS:
             videos[(path.parent, path.stem.lower())] = path
-        elif ext in SUB_EXTS and not path.stem.lower().endswith(suffix.lower()):
+        elif ext in SUB_EXTS and not path.stem.lower().endswith(".synced"):
             subs.append(path)
 
     pairs = []
@@ -452,12 +543,67 @@ def find_pairs(folder, recursive, suffix):
     return pairs, unmatched
 
 
+def backup_path(sub):
+    return sub.parent / BACKUP_DIR / sub.name
+
+
+def build_candidates(audio, cues, args):
+    """보정 후보를 간단한 것부터 순서대로 만든다. [(이름, TimeMap, PSR, 구간정보), ...]"""
+    max_offset = args.max_offset * 1000
+    segment_ms = args.segment * 1000
+    search_ms = args.segment_search * 1000
+
+    base_off, base_psr, base_score = global_search(audio, cues, 1.0, max_offset)
+    base_segments = segment_offsets(audio, cues, 1.0, base_off, segment_ms, search_ms)
+
+    ratio = 1.0
+    drift = 0.0
+    if not args.no_ratio:
+        # 큰 비율 차이(약 4% 이상)는 구간 안에서도 번져 보이므로 전체 상관으로 찾는다
+        best_score = base_score
+        for candidate in FPS_RATIOS:
+            if abs(candidate - 1.0) < SMALL_RATIO:
+                continue
+            _, r_psr, r_score = global_search(audio, cues, candidate, max_offset)
+            if r_psr >= PSR_MIN and r_score > best_score * BIG_RATIO_GAIN:
+                best_score = r_score
+                ratio = candidate
+        # 작은 비율 차이(23.976 <-> 24)는 잡음에 약하므로 구간별 추세로만 판단한다
+        if ratio == 1.0:
+            ratio, drift = estimate_ratio(base_segments)
+
+    candidates = []
+    split_source = (1.0, base_off, base_psr, base_segments)
+    if ratio != 1.0:
+        r_off, r_psr, _ = global_search(audio, cues, ratio, max_offset)
+        r_segments = segment_offsets(audio, cues, ratio, r_off, segment_ms, search_ms)
+        candidates.append(("비율+이동", TimeMap(ratio, [(0, r_off)]), r_psr))
+        split_source = (ratio, r_off, r_psr, r_segments)
+    candidates.append(("전체 이동", TimeMap(1.0, [(0, base_off)]), base_psr))
+
+    if not args.no_split:
+        s_ratio, s_off, s_psr, s_segments = split_source
+        points = reliable_segments(s_segments)
+        offsets = [o for _, o in points]
+        if len(offsets) >= 2 and max(offsets) - min(offsets) > SPREAD_WARN_MS:
+            pieces = refine_bounds(audio, cues, s_ratio, piecewise_offsets(s_segments, s_off))
+            candidates.append(("구간별", TimeMap(s_ratio, pieces), s_psr))
+
+    info = {"base_off": base_off, "base_psr": base_psr, "drift": drift,
+            "segments": base_segments}
+    return candidates, info
+
+
 def process(video, sub, args):
     row = {
-        "영상": video.name, "자막": sub.name, "판정": "", "오프셋(초)": "", "비율": "",
-        "신뢰도(PSR)": "", "구간별 오프셋(초)": "", "결과 파일": "", "메모": "",
+        "폴더": "", "자막": sub.name, "판정": "", "적용 방법": "", "오프셋(초)": "",
+        "비율": "", "신뢰도(PSR)": "", "원본 검증": "", "보정 후 검증": "",
+        "시도 내역": "", "메모": "",
     }
-    text, encoding = read_text(sub)
+    # 이미 덮어쓴 적이 있으면 백업해 둔 원본을 기준으로 다시 계산한다 (반복 실행해도 안전)
+    backup = backup_path(sub)
+    source = backup if backup.exists() else sub
+    text, encoding = read_text(source)
     ext = sub.suffix.lower()
     cues = parse_cues(text, ext)
     if len(cues) < 10:
@@ -465,76 +611,101 @@ def process(video, sub, args):
         row["메모"] = "자막 대사를 읽지 못함 (대사 %d개)" % len(cues)
         return row
 
-    audio_sig = speech_signal(extract_audio(video))
-    (ratio, offset_ms, score, psr), audio = analyze(
-        audio_sig, cues, args.max_offset * 1000, not args.no_ratio)
-    segments = segment_offsets(audio, cues, ratio, offset_ms,
-                               args.segment * 1000, args.segment_search * 1000)
+    audio = pad_audio(speech_signal(extract_audio(video)), cues)
+    segment_ms = args.segment * 1000
+    search_ms = args.segment_search * 1000
+    candidates, info = build_candidates(audio, cues, args)
+    row["신뢰도(PSR)"] = "%.1f" % info["base_psr"]
 
-    row["오프셋(초)"] = "%+.2f" % (offset_ms / 1000.0)
-    row["비율"] = "%.5f" % ratio
-    row["신뢰도(PSR)"] = "%.1f" % psr
-    seg_text = []
-    reliable = []
-    for seg_start, off, seg_psr, _ in segments:
-        mark = "" if seg_psr >= PSR_MIN else "?"
-        seg_text.append("%d분:%+.2f%s" % (seg_start // 60000, off / 1000.0, mark))
-        if seg_psr >= PSR_MIN:
-            reliable.append(off)
-    row["구간별 오프셋(초)"] = " ".join(seg_text)
-    spread = (max(reliable) - min(reliable)) if len(reliable) >= 2 else 0
-
-    if psr < PSR_MIN and not args.force:
-        row["판정"] = "판단불가"
-        row["메모"] = "음성/자막 일치도가 낮음. 수동 확인 필요 (--force로 강제 적용 가능)"
+    # 1) 점검: 원본 그대로 검증
+    original = evaluate(audio, cues, TimeMap(1.0, [(0, 0)]), segment_ms, search_ms)
+    row["원본 검증"] = describe(original)
+    if passes(original):
+        row["판정"] = "정상"
+        row["오프셋(초)"] = "%+.2f" % (original["residual"] / 1000.0)
+        if source is backup:
+            row["메모"] = "백업 원본 기준으로 정상"
         return row
 
-    use_split = args.split and spread > SPREAD_WARN_MS
-    if use_split:
-        pieces = refine_bounds(audio, cues, ratio, piecewise_offsets(segments, offset_ms))
-        tmap = TimeMap(ratio, pieces)
-    else:
-        tmap = TimeMap(ratio, [(0, offset_ms)])
+    # 2) 수정 -> 3) 검증 -> 실패하면 다음 방법으로 재수정
+    attempts = []
+    chosen = None
+    best_any = None
+    min_score = original["score"] + SCORE_GAIN_MIN * abs(original["score"])
+    for name, tmap, psr in candidates:
+        ev = evaluate(audio, cues, tmap, segment_ms, search_ms)
+        if best_any is None or ev["score"] > best_any[2]["score"]:
+            best_any = (name, tmap, ev, psr)
+        if psr < PSR_MIN:
+            attempts.append("%s: 신뢰도 낮음(PSR %.1f)" % (name, psr))
+            continue
+        if not passes(ev):
+            attempts.append("%s: 검증 실패(%s)" % (name, describe(ev)))
+            continue
+        if ev["score"] < min_score:
+            attempts.append("%s: 개선 없음(%s)" % (name, describe(ev)))
+            continue
+        attempts.append("%s: 통과" % name)
+        chosen = (name, tmap, ev, psr)
+        break
+    row["시도 내역"] = " / ".join(attempts)
 
-    needs_fix = use_split or ratio != 1.0 or abs(offset_ms) >= OK_OFFSET_MS
-    if not needs_fix:
-        row["판정"] = "정상"
-    elif use_split:
-        row["판정"] = "구간별 보정"
-    else:
-        row["판정"] = "보정 필요"
-
-    notes = []
-    if psr < PSR_GOOD:
-        notes.append("신뢰도 보통, 결과 확인 권장")
-    if spread > SPREAD_WARN_MS and not use_split:
-        notes.append("구간별 차이 %.1f초 (중간 광고 컷 등). --split 사용 검토" % (spread / 1000.0))
-    row["메모"] = "; ".join(notes)
-
-    if needs_fix and not args.check:
-        out = sub.with_name(sub.stem + args.suffix + sub.suffix)
-        if out.exists() and not args.overwrite:
-            row["메모"] = "; ".join(notes + ["결과 파일이 이미 있어 저장 안 함 (--overwrite)"])
+    if chosen is None:
+        if args.force and best_any is not None:
+            chosen = best_any
+            row["메모"] = "검증 통과 못 했지만 --force로 적용"
+        else:
+            row["판정"] = "수동 확인 필요"
+            row["메모"] = "모든 보정 방법이 검증을 통과하지 못해 원본 유지"
             return row
-        used = write_text(out, apply_map(text, ext, tmap), encoding)
-        row["결과 파일"] = out.name
-        if used != encoding:
-            notes.append("인코딩 %s -> %s" % (encoding, used))
-            row["메모"] = "; ".join(notes)
+
+    name, tmap, ev, psr = chosen
+    row["적용 방법"] = name
+    row["신뢰도(PSR)"] = "%.1f" % psr
+    row["비율"] = "%.5f" % tmap.ratio
+    offsets = []
+    for off in tmap.offsets:
+        offsets.append("%+.2f" % (off / 1000.0))
+    row["오프셋(초)"] = " → ".join(offsets)
+    row["보정 후 검증"] = describe(ev)
+
+    if args.check:
+        row["판정"] = "보정 필요"
+        return row
+
+    # 4) 덮어쓰기: 처음 한 번만 원본을 백업해 둔다
+    if not backup.exists():
+        backup.parent.mkdir(exist_ok=True)
+        shutil.copy2(str(sub), str(backup))
+    used = write_text(sub, apply_map(text, ext, tmap), encoding)
+    row["판정"] = "보정 완료"
+    if used != encoding:
+        row["메모"] = (row["메모"] + "; " if row["메모"] else "") + "인코딩 %s -> %s" % (encoding, used)
     return row
+
+
+def restore(folder):
+    """백업 폴더의 원본 자막을 원래 위치로 되돌린다."""
+    count = 0
+    for backup_dir in sorted(folder.glob("**/" + BACKUP_DIR)):
+        if not backup_dir.is_dir():
+            continue
+        for path in sorted(backup_dir.iterdir()):
+            if path.is_file():
+                shutil.copy2(str(path), str(backup_dir.parent / path.name))
+                count += 1
+    print("원본 자막 %d개를 되돌렸습니다." % count)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="폴더 안의 영상/자막 싱크를 점검하고 맞춥니다.")
     parser.add_argument("folder", help="영상과 자막이 있는 폴더")
-    parser.add_argument("--check", action="store_true", help="점검만 하고 파일은 만들지 않음")
-    parser.add_argument("--split", action="store_true",
-                        help="구간마다 어긋난 정도가 다르면(광고 컷 등) 구간별로 따로 보정")
+    parser.add_argument("--check", action="store_true", help="점검만 하고 자막은 수정하지 않음")
     parser.add_argument("--recursive", action="store_true", help="하위 폴더까지 검사")
-    parser.add_argument("--suffix", default=".synced", help="결과 파일 이름에 붙일 말 (기본 .synced)")
-    parser.add_argument("--overwrite", action="store_true", help="이미 있는 결과 파일을 덮어씀")
-    parser.add_argument("--force", action="store_true", help="신뢰도가 낮아도 보정 파일을 만듦")
+    parser.add_argument("--restore", action="store_true", help="백업해 둔 원본 자막으로 되돌림")
+    parser.add_argument("--force", action="store_true", help="검증을 통과하지 못해도 가장 나은 보정을 적용")
     parser.add_argument("--no-ratio", action="store_true", help="프레임레이트 비율 보정을 시도하지 않음")
+    parser.add_argument("--no-split", action="store_true", help="구간별 보정을 시도하지 않음")
     parser.add_argument("--max-offset", type=int, default=120, help="찾을 최대 어긋남(초, 기본 120)")
     parser.add_argument("--segment", type=int, default=120, help="구간 점검 단위(초, 기본 120)")
     parser.add_argument("--segment-search", type=int, default=150,
@@ -545,8 +716,11 @@ def main(argv=None):
     folder = Path(args.folder)
     if not folder.is_dir():
         sys.exit("폴더를 찾을 수 없습니다: %s" % folder)
+    if args.restore:
+        restore(folder)
+        return
 
-    pairs, unmatched = find_pairs(folder, args.recursive, args.suffix)
+    pairs, unmatched = find_pairs(folder, args.recursive)
     print("영상/자막 쌍 %d개, 짝 없는 자막 %d개" % (len(pairs), len(unmatched)))
 
     rows = []
@@ -555,16 +729,17 @@ def main(argv=None):
         try:
             row = process(video, sub, args)
         except Exception as exc:  # 한 파일 실패가 전체를 멈추지 않도록
-            row = {"영상": video.name, "자막": sub.name, "판정": "오류", "메모": str(exc)}
-        print("    -> %s  오프셋 %s초  비율 %s  PSR %s  %s" % (
-            row.get("판정", ""), row.get("오프셋(초)", ""), row.get("비율", ""),
-            row.get("신뢰도(PSR)", ""), row.get("메모", "")))
+            row = {"자막": sub.name, "판정": "오류", "메모": str(exc)}
+        row["폴더"] = str(sub.parent.relative_to(folder))
+        print("    -> %s  %s  %s" % (row.get("판정", ""), row.get("적용 방법", ""),
+                                    row.get("메모", "") or row.get("시도 내역", "")))
         rows.append(row)
     for sub in unmatched:
-        rows.append({"자막": sub.name, "판정": "짝 없음", "메모": "같은 이름의 영상 파일이 없음"})
+        rows.append({"폴더": str(sub.parent.relative_to(folder)), "자막": sub.name,
+                     "판정": "짝 없음", "메모": "같은 이름의 영상 파일이 없음"})
 
-    fields = ["영상", "자막", "판정", "오프셋(초)", "비율", "신뢰도(PSR)",
-              "구간별 오프셋(초)", "결과 파일", "메모"]
+    fields = ["폴더", "자막", "판정", "적용 방법", "오프셋(초)", "비율", "신뢰도(PSR)",
+              "원본 검증", "보정 후 검증", "시도 내역", "메모"]
     report = folder / args.report
     with open(report, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -575,7 +750,10 @@ def main(argv=None):
     summary = {}
     for row in rows:
         summary[row["판정"]] = summary.get(row["판정"], 0) + 1
-    print("\n요약: " + ", ".join("%s %d" % (k, v) for k, v in summary.items()))
+    parts = []
+    for key, value in summary.items():
+        parts.append("%s %d" % (key, value))
+    print("\n요약: " + ", ".join(parts))
     print("보고서: %s" % report)
 
 
